@@ -1,8 +1,10 @@
 ---
-title: "Codes for ML training"
+title: "Benchmarking Machine Learning Models for Cell Type Annotation in Single-Cell vs Single-Nucleus RNA-Seq Data"
 author: "GT"
-date: "2024-12-30"
+date: "2024-12-19"
 output: html_document
+editor_options: 
+  chunk_output_type: console
 ---
 
 ```{r setup, include=FALSE}
@@ -11,20 +13,375 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
-```
-
-## Including Plots
-
-You can also embed plots, for example:
 
 ```{r pressure, echo=FALSE}
-plot(pressure)
+# Load necessary libraries
+library(caret)
+library(e1071)
+library(randomForest)
+library(rpart)
+library(glmnet)
+library(xgboost)
+library(class)
+library(naivebayes)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(fmsb)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+# this code stars with a pre-processed suerat obj created with the pbmc3k (the basic seurat tutorial was followed w/out modification). The cell labels were annotated with SingleR and hpca.ref <- celldex::HumanPrimaryCellAtlasData()
+
+```{r}
+#lets counts the cells per cluster and remove the clusters with >50 cells
+table(pbmc$hpca.main)
+
+Idents(pbmc) <- pbmc$hpca.main
+DimPlot(pbmc, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+
+# Subset the object by excluding specific categories
+pbmc.red <- subset(pbmc, idents= c("B_cell", "Monocyte", "NK_cell", "Pre-B_cell_CD34-", "T_cells"))
+
+pbmc.red <- subset(pbmc, idents = !hpca.main %in% c("Platelets", "Pro-B_cell_CD34+", "CMP"))
+
+table(pbmc.red$hpca.main)
+
+#creat a df for pbmc samll
+
+table(pbmc.red$hpca.main)
+
+Idents(pbmc.red) <-pbmc.red$hpca.main
+DimPlot(pbmc.red, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+
+table(srat.red$hpca.main)
+
+
+metadata <- pbmc.red[[]]
+
+ #Retrieve data in an expression in normalized data
+pbmc.red.data <- pbmc.red[["RNA"]]$data
+ head(pbmc.red.data,5)
+pbmc.red.data.transp <- t(pbmc.red.data)
+ head(pbmc.red.data.transp)
+ 
+ # Save old identity classes (the cluster labels) for reference.
+#srat.red[["hpca.main"]] <- Idents(object = srat.red)
+# metadata <-srat.red[[]]
+pbmc.red.data.transp <- data.frame(pbmc.red.data.transp)
+pbmc.red.data.transp$hpca.main <- metadata$hpca.main
+ head(pbmc.red.data.transp)
+ dim(pbmc.red.data.transp)
+ df.pbmc.red =  pbmc.red.data.transp
+ dim(df.pbmc.red)
+ # let's remove the cell without a label
+ df.pbmc.red <- na.omit(df.pbmc.red)
+  dim(df.pbmc.red)
+  # filtering the 4000 most variable genes
+  seurat_df.pbmc <- na.omit(pbmc.red@assays$RNA@meta.data$var.features) # this vector has the 4000 hvf from the original Seurat object  
+  #let's add a last col with the cell type lables ( this is the col in metadata named hpca.main)
+seurat_df.pbmc <- c(seurat_df.pbmc,"hpca.main")
+  
+  #Assuming 'df' is your dataframe and 'b' is your vector
+filtered_df.pbmc <- df.pbmc.red[, colnames(df.pbmc.red) %in% seurat_df.pbmc]
+filtered_df.pbmc <- na.omit(filtered_df.pbmc)
+df.pbmc <-filtered_df.pbmc
+```
+
+```{r}
+
+# Data Preparation
+set.seed(123)  # Ensure reproducibility
+
+# Assume 'df' contains gene features and cell type classification in the last column
+features <- df[, -ncol(df)]
+labels <- as.factor(df[, ncol(df)])
+
+# Train-test split
+train_indices <- createDataPartition(labels, p = 0.7, list = FALSE)
+train_features <- features[train_indices, ]
+test_features <- features[-train_indices, ]
+train_labels <- labels[train_indices]
+test_labels <- labels[-train_indices]
+
+```
+
+```{r}
+
+# Initialize results and feature importance storage
+results <- data.frame(Model = character(), Accuracy = numeric(), Precision = numeric(), 
+                      Recall = numeric(), F1_Score = numeric(), stringsAsFactors = FALSE)
+top_features_list <- list()
+
+# Helper function to calculate accuracy
+calculate_accuracy <- function(predictions, true_labels) {
+  sum(predictions == true_labels) / length(true_labels)
+}
+
+# Helper function to calculate precision, recall, and F1-score
+calculate_metrics <- function(true_labels, predicted_labels) {
+  cm <- confusionMatrix(predicted_labels, true_labels)
+  precision <- mean(cm$byClass[, "Precision"], na.rm = TRUE)  # Macro-average precision
+  recall <- mean(cm$byClass[, "Recall"], na.rm = TRUE)        # Macro-average recall
+  f1_score <- mean(cm$byClass[, "F1"], na.rm = TRUE)          # Macro-average F1-score
+  list(Precision = precision, Recall = recall, F1_Score = f1_score, CM = cm)
+}
+```
+
+```{r}
+### Model Implementations
+
+# Remove constant features
+train_features <- train_features[, apply(train_features, 2, var) != 0]
+test_features <- test_features[, colnames(train_features), drop = FALSE]
+
+
+# 1. Support Vector Machine (SVM)
+# Train the SVM model
+svm_model <- svm(train_features, train_labels, probability = TRUE)
+
+####################
+# Identify missing columns
+missing_features <- setdiff(colnames(train_features), colnames(test_features))
+
+# Add missing columns with default values
+for (col in missing_features) {
+ test_features[, col] <- 0
+}
+
+# Align column order
+test_features <- test_features[, colnames(train_features), drop = FALSE]
+
+# Ensure all columns are numeric
+test_features <- as.data.frame(lapply(test_features, as.numeric))
+
+
+##########
+# Predict on test data
+svm_predictions <- predict(svm_model, test_features)
+
+# Ensure predictions and test labels have the same length
+stopifnot(length(svm_predictions) == length(test_labels))
+
+# Calculate accuracy
+svm_accuracy <- calculate_accuracy(svm_predictions, test_labels)
+
+# Calculate metrics
+svm_metrics <- calculate_metrics(test_labels, svm_predictions)
+
+# Add results to the results dataframe
+results <- rbind(results, data.frame(
+  Model = "SVM",
+  Accuracy = svm_accuracy,
+  Precision = svm_metrics$Precision,
+  Recall = svm_metrics$Recall,
+  F1_Score = svm_metrics$F1_Score
+))
+
+
+# Plot Confusion Matrix for SVM
+svm_cm_table <- as.data.frame(svm_metrics$CM$table)
+svm_cm_plot <- ggplot(svm_cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Confusion Matrix - SVM", x = "Actual", y = "Predicted") +
+  theme_minimal() + RotatedAxis()
+print(svm_cm_plot) 
+
+
+# 3. Decision Tree
+#dt_model <- rpart(train_labels ~ ., data = as.data.frame(train_features), method = "class")
+dt_predictions <- predict(dt_model, newdata = as.data.frame(test_features), type = "class")
+dt_accuracy <- calculate_accuracy(dt_predictions, test_labels)
+dt_metrics <- calculate_metrics(test_labels, dt_predictions)
+results <- rbind(results, data.frame(Model = "Decision Tree", Accuracy = dt_accuracy,
+                                      Precision = dt_metrics$Precision, Recall = dt_metrics$Recall, 
+                                      F1_Score = dt_metrics$F1_Score))
+
+# Plot Confusion Matrix for Decision Tree
+dt_cm_table <- as.data.frame(dt_metrics$CM$table)
+dt_cm_plot <- ggplot(dt_cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Confusion Matrix - Decision Tree", x = "Actual", y = "Predicted") +
+  theme_minimal() + RotatedAxis()
+print(dt_cm_plot)
+
+# 4. Random Forest
+#rf_model <- randomForest(train_features, y = train_labels)
+rf_predictions <- predict(rf_model, test_features)
+rf_accuracy <- calculate_accuracy(rf_predictions, test_labels)
+rf_metrics <- calculate_metrics(test_labels, rf_predictions)
+rf_importance <- importance(rf_model)
+top_features_list$RandomForest <- rownames(rf_importance)[order(-rf_importance[, 1])][1:20]
+results <- rbind(results, data.frame(Model = "Random Forest", Accuracy = rf_accuracy,
+                                      Precision = rf_metrics$Precision, Recall = rf_metrics$Recall, 
+                                      F1_Score = rf_metrics$F1_Score))
+
+# Plot Confusion Matrix for Random Forest
+rf_cm_table <- as.data.frame(rf_metrics$CM$table)
+rf_cm_plot <- ggplot(rf_cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high =  "blue") +
+  labs(title = "Confusion Matrix - Random Forest", x = "Actual", y = "Predicted") +
+  theme_minimal() + RotatedAxis()
+print(rf_cm_plot)
+
+# 7. k-Nearest Neighbors (k-NN)
+knn_predictions <- knn(train_features, test_features, cl = train_labels, k = 5)
+knn_accuracy <- calculate_accuracy(knn_predictions, test_labels)
+knn_metrics <- calculate_metrics(test_labels, knn_predictions)
+results <- rbind(results, data.frame(Model = "k-NN", Accuracy = knn_accuracy,
+                                      Precision = knn_metrics$Precision, Recall = knn_metrics$Recall, 
+                                      F1_Score = knn_metrics$F1_Score))
+
+# Plot Confusion Matrix for k-NN
+knn_cm_table <- as.data.frame(knn_metrics$CM$table)
+knn_cm_plot <- ggplot(knn_cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Confusion Matrix - k-NN", x = "Actual", y = "Predicted") +
+  theme_minimal() + RotatedAxis()
+print(knn_cm_plot)
+
+#save.image("~/Desktop/save.model.night.RData")
+
+
+# 2. Logistic Regression
+#logistic_model <- glm(train_labels ~ ., data = as.data.frame(train_features), family = "binomial")
+
+logistic_prob <- predict(logistic_model, newdata = as.data.frame(test_features), type = "response")
+logistic_predictions <- factor(ifelse(logistic_prob > 0.5, levels(train_labels)[2], levels(train_labels)[1]), levels = levels(train_labels))
+logistic_accuracy <- calculate_accuracy(logistic_predictions, test_labels)
+logistic_metrics <- calculate_metrics(test_labels, logistic_predictions)
+results <- rbind(results, data.frame(Model = "Logistic Regression", Accuracy = logistic_accuracy,
+                                      Precision = logistic_metrics$Precision, Recall = logistic_metrics$Recall, 
+                                      F1_Score = logistic_metrics$F1_Score))
+
+# Plot Confusion Matrix for Logistic Regression
+logistic_cm_table <- as.data.frame(logistic_metrics$CM$table)
+logistic_cm_plot <- ggplot(logistic_cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Confusion Matrix - Logistic Regression", x = "Actual", y = "Predicted") +
+  theme_minimal() + RotatedAxis()
+print(logistic_cm_plot)
+
+
+
+# 5. Elastic Net Regularization
+#enet_model <- cv.glmnet(as.matrix(train_features), train_labels, family = "multinomial", alpha = 0.5)
+enet_predictions <- predict(enet_model, newx = as.matrix(test_features), s = "lambda.min", type = "class")
+enet_predictions <- factor(enet_predictions, levels = levels(test_labels))
+enet_accuracy <- calculate_accuracy(enet_predictions, test_labels)
+enet_metrics <- calculate_metrics(test_labels, enet_predictions)
+results <- rbind(results, data.frame(Model = "Elastic Net", Accuracy = enet_accuracy,
+                                      Precision = enet_metrics$Precision, Recall = enet_metrics$Recall, 
+                                      F1_Score = enet_metrics$F1_Score))
+
+# Plot Confusion Matrix for Elastic Net
+enet_cm_table <- as.data.frame(enet_metrics$CM$table)
+enet_cm_plot <- ggplot(enet_cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Confusion Matrix - Elastic Net", x = "Actual", y = "Predicted") +
+  theme_minimal() + RotatedAxis()
+print(enet_cm_plot)
+
+# 6. XGBoost
+#train_matrix <- xgb.DMatrix(data = as.matrix(train_features), label = as.numeric(train_labels) - 1)
+test_matrix <- xgb.DMatrix(data = as.matrix(test_features), label = as.numeric(test_labels) - 1)
+#xgb_model <- xgboost(data = train_matrix, max_depth = 6, eta = 0.3, nrounds = 100,  objective = "multi:softmax", num_class = length(levels(labels)), verbose = 0)
+xgb_predictions <- predict(xgb_model, test_matrix)
+xgb_predictions <- factor(xgb_predictions, levels = 0:(length(levels(test_labels)) - 1), labels = levels(test_labels))
+xgb_accuracy <- calculate_accuracy(xgb_predictions, test_labels)
+xgb_metrics <- calculate_metrics(test_labels, xgb_predictions)
+xgb_importance <- xgb.importance(feature_names = colnames(train_features), model = xgb_model)
+top_features_list$XGBoost <- xgb_importance$Feature[1:20]
+results <- rbind(results, data.frame(Model = "XGBoost", Accuracy = xgb_accuracy,
+                                      Precision = xgb_metrics$Precision, Recall = xgb_metrics$Recall, 
+                                      F1_Score = xgb_metrics$F1_Score))
+
+# Plot Confusion Matrix for XGBoost
+xgb_cm_table <- as.data.frame(xgb_metrics$CM$table)
+xgb_cm_plot <- ggplot(xgb_cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Confusion Matrix - XGBoost", x = "Actual", y = "Predicted") +
+  theme_minimal() + RotatedAxis()
+print(xgb_cm_plot)
+
+# 8. Naive Bayes
+#nb_model <- naive_bayes(train_features, train_labels)
+nb_predictions <- predict(nb_model, test_features)
+nb_accuracy <- calculate_accuracy(nb_predictions, test_labels)
+nb_metrics <- calculate_metrics(test_labels, nb_predictions)
+results <- rbind(results, data.frame(Model = "Naive Bayes", Accuracy = nb_accuracy,
+                                      Precision = nb_metrics$Precision, Recall = nb_metrics$Recall, 
+                                      F1_Score = nb_metrics$F1_Score))
+
+# Plot Confusion Matrix for Naive Bayes
+nb_cm_table <- as.data.frame(nb_metrics$CM$table)
+nb_cm_plot <- ggplot(nb_cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Confusion Matrix - Naive Bayes", x = "Actual", y = "Predicted") +
+  theme_minimal() + RotatedAxis()
+print(nb_cm_plot)
+
+# 9. Visualization
+#results1 = results[c(1:5,7,8,9) ,]
+#results = results1
+# Accuracy Comparison
+accuracy_plot <- ggplot(results, aes(x = reorder(Model, -Accuracy), y = Accuracy, fill = Model)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Model Accuracy Comparison", x = "Model", y = "Accuracy") +
+  theme_minimal()+ RotatedAxis()
+print(accuracy_plot)
+
+write.csv(results, file= " results.pbmc10k.csv")
+
+# Precision, Recall, and F1-Score Comparison
+results_long <- results %>%
+  pivot_longer(cols = c(Precision, Recall, F1_Score), names_to = "Metric", values_to = "Value")
+grouped_bar_chart <- ggplot(results_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Model Comparison: Precision, Recall, and F1-Score", 
+       x = "Model", y = "Value") +
+  scale_fill_brewer(palette = "Dark2") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(grouped_bar_chart)
+
+# Heatmap of Metrics
+heatmap_data <- melt(results, id.vars = "Model")
+heatmap_plot <- ggplot(heatmap_data, aes(x = variable, y = Model, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0.5, limit = c(0, 1), space = "Lab") +
+  labs(title = "Model Comparison Heatmap", x = "Metric", y = "Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(heatmap_plot)
+
+# Radar Chart
+radar_data <- results[, c("Model", "Precision", "Recall", "F1_Score")]
+rownames(radar_data) <- radar_data$Model
+radar_data <- radar_data[, -1]
+radar_data <- rbind(rep(1, 3), rep(0, 3), radar_data)  # Add upper and lower bounds
+radarchart(radar_data, axistype = 1, 
+           pcol = rainbow(nrow(radar_data) - 2), 
+           plwd = 2, plty = 1, 
+           title = "Model Comparison Radar Chart")
+legend("topright", legend = rownames(radar_data)[3:nrow(radar_data)], 
+       col = rainbow(nrow(radar_data) - 2), lty = 1, lwd = 2)
+
+save.image("~/Desktop/save.model.ML.trained.RData")
+```
