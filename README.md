@@ -1,4 +1,4 @@
-# Codes-and-Trained-ML-models-for-scRNA-analysis
+# Codes-to-train-and-test-ML-models-for-scRNA-analysis
 # R Codes: 
 
 This GitHub repository contains the R scripts used to generate all analyses for the paper.
